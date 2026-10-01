@@ -26,7 +26,7 @@ python -m torch.distributed.run \
 --master_port=$MASTER_PORT \
 src/train.py \
 --stage sft \
---model_name_or_path meta-llama/Llama-3.1-8B-Instruct \
+--model_name_or_path /root/autodl-tmp/models/Llama-3.1-8B-Instruct \
 --do_train \
 --dataset DeAR-COT \
 --template llama3 \
@@ -47,5 +47,5 @@ src/train.py \
 --plot_loss \
 --report_to wandb \
 --cutoff_len 5000 \
---bf16 \
+--fp16 \
 '

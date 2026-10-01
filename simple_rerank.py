@@ -10,69 +10,117 @@ DTYPE = {
     "float32": torch.float32,
 }
 
-def load_ranker(model_or_adapter_path: str, torch_dtype: str = "auto", device: str = "auto"):
+def load_ranker(
+    model_or_adapter_path: str,
+    torch_dtype: str = "auto",
+    device: str = "auto",
+):
     """
-    Pass EITHER:
-      - a PEFT LoRA adapter dir / HF repo id  (contains adapter_config.json)
-      - OR a merged/original model dir / HF repo id (normal Transformers model)
+    加载本地 PEFT LoRA，或者完整合并模型。
 
-    Returns: (tokenizer, model, device_str)
+    Returns:
+        tokenizer, model, device
     """
+    if torch_dtype not in DTYPE:
+        raise ValueError(f"Unsupported torch_dtype: {torch_dtype}")
+
     dtype = DTYPE[torch_dtype]
 
-    # Try to interpret as a PEFT adapter first
-    is_peft = False
-    peft_cfg = None
+    # 判断当前路径是不是 PEFT LoRA
     try:
-        peft_cfg = PeftConfig.from_pretrained(model_or_adapter_path)
+        peft_cfg = PeftConfig.from_pretrained(
+            model_or_adapter_path,
+            local_files_only=True,
+        )
         is_peft = True
     except Exception:
+        peft_cfg = None
         is_peft = False
 
     if is_peft:
-        # ----- LoRA adapter path -----
-        base_id = peft_cfg.base_model_name_or_path
-        tok = AutoTokenizer.from_pretrained(base_id)
+        # 本地 Llama-3.1-8B 基座
+        base_id = "/root/autodl-tmp/models/Llama-3.1-8B"
+
+        print("Loading local base model:", base_id)
+        print("Loading local LoRA:", model_or_adapter_path)
+
+        tok = AutoTokenizer.from_pretrained(
+            base_id,
+            local_files_only=True,
+        )
+
         if tok.pad_token is None:
             tok.pad_token = tok.eos_token
             tok.pad_token_id = tok.eos_token_id
+
         tok.padding_side = "right"
 
         base = AutoModelForSequenceClassification.from_pretrained(
-            base_id, num_labels=1, torch_dtype=dtype
+            base_id,
+            num_labels=1,
+            torch_dtype=dtype,
+            local_files_only=True,
+            low_cpu_mem_usage=True,
         )
-        model = PeftModel.from_pretrained(base, model_or_adapter_path)
+
+        if base.config.pad_token_id is None:
+            base.config.pad_token_id = tok.pad_token_id
+
+        model = PeftModel.from_pretrained(
+            base,
+            model_or_adapter_path,
+            local_files_only=True,
+        )
+
         model = model.merge_and_unload()
+
     else:
-        # ----- Merged / original model path -----
-        tok = AutoTokenizer.from_pretrained(model_or_adapter_path)
+        # 加载完整模型
+        print("Loading merged model:", model_or_adapter_path)
+
+        tok = AutoTokenizer.from_pretrained(
+            model_or_adapter_path,
+            local_files_only=True,
+        )
+
         if tok.pad_token is None:
             tok.pad_token = tok.eos_token
             tok.pad_token_id = tok.eos_token_id
+
         tok.padding_side = "right"
 
-        # Note: for merged/original, we DO NOT force num_labels=1 — we load as saved.
         model = AutoModelForSequenceClassification.from_pretrained(
-            model_or_adapter_path, torch_dtype=dtype
+            model_or_adapter_path,
+            torch_dtype=dtype,
+            local_files_only=True,
+            low_cpu_mem_usage=True,
         )
 
     model.eval()
 
-    # Make batching safe for LLaMA-style models
+    # LLaMA Padding 配置
     if getattr(model.config, "pad_token_id", None) is None:
         model.config.pad_token_id = tok.pad_token_id
-    if getattr(model.config, "bos_token_id", None) is None and tok.bos_token_id is not None:
+
+    if (
+        getattr(model.config, "bos_token_id", None) is None
+        and tok.bos_token_id is not None
+    ):
         model.config.bos_token_id = tok.bos_token_id
-    if getattr(model.config, "eos_token_id", None) is None and tok.eos_token_id is not None:
+
+    if (
+        getattr(model.config, "eos_token_id", None) is None
+        and tok.eos_token_id is not None
+    ):
         model.config.eos_token_id = tok.eos_token_id
 
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
+
     model.to(device)
 
     return tok, model, device
-
-
+ 
 @torch.inference_mode()
 def score_pair(tokenizer, model, device, query: str, passage: str, title: str = "",
                q_max_len: int = 32, p_max_len: int = 196) -> float:
@@ -121,8 +169,15 @@ def rerank(tokenizer, model, device, query: str, docs: List[Tuple[str, str]],
 # 1) Load either a PEFT adapter OR a merged model
 # peft_or_model_path = ""      # PEFT adapter dir
 # peft_or_model_path = ""               # merged/original model dir
-peft_or_model_path = "abdoelsayed/dear-8b-reranker-ce-v1"
-tokenizer, model, device = load_ranker(peft_or_model_path, torch_dtype="bfloat16")
+peft_or_model_path = (
+    "/root/autodl-tmp/models/"
+    "dear-8b-reranker-ce-lora-v1"
+)
+
+tokenizer, model, device = load_ranker(
+    peft_or_model_path,
+    torch_dtype="float16",
+)
 
 # 2) Single pair
 q = "What is llama?"

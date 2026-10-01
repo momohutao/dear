@@ -23,11 +23,12 @@ Thumbs.db
 *.bin
 *.ckpt
 *.gguf
+*.zip
 
 wandb/
 data/*
 models/*
-results/*
+/results/
 out_list_wise/
 
 

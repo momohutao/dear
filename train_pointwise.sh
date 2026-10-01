@@ -21,13 +21,13 @@ export NCCL_IB_DISABLE=0
 deepspeed --include localhost:0,1,2,3 pointwise_reranker/reranker_train.py \
   --deepspeed ./config/ds_config.json \
   --output_dir ./models/test_training \
-  --model_name_or_path meta-llama/Llama-3.1-8B \
-  --teacher_model_name_or_path abdoelsayed/llama2-13b-rankllama-teacher \
+  --model_name_or_path /root/autodl-tmp/models/Llama-3.1-8B \
+  --teacher_model_name_or_path /root/autodl-tmp/models/llama2-13b-rankllama-teacher \
   --temperature 2 \
   --alpha 0.1 \
   --save_steps 200 \
   --dataset_name Tevatron/msmarco-passage \
-  --bf16 \
+  --fp16 \
   --per_device_train_batch_size 2 \
   --gradient_accumulation_steps 2 \
   --train_n_passages 2 \
