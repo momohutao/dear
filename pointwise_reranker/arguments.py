@@ -224,6 +224,8 @@ class DataArguments:
     train_n_passages: int = field(default=8)
     positive_passage_no_shuffle: bool = field(default=False)
     negative_passage_no_shuffle: bool = field(default=False)
+    hard_negative_probability: float = field(default=0.0)
+    hard_negative_candidates: Optional[str] = field(default=None)
 
     encode_in_path: List[str] = field(default=None)
     encoded_save_path: str = field(default=None)
@@ -248,6 +250,10 @@ class DataArguments:
     data_cache_dir: Optional[str] = field(default=None)
 
     def __post_init__(self):
+        if not 0.0 <= self.hard_negative_probability <= 1.0:
+            raise ValueError('hard_negative_probability must be in [0,1]')
+        if self.hard_negative_probability > 0 and not self.hard_negative_candidates:
+            raise ValueError('Runtime hard injection requires --hard_negative_candidates from a completed mining run')
         if self.dataset_name is not None:
             # using load_from_disk; we still set split names for convenience
             self.dataset_split = 'train'

@@ -1,6 +1,22 @@
 #!/usr/bin/env bash
-# Train CE + KD + RAT/KK + teacher-gated PN-gap + PN-lambda from raw Llama-3.2-3B.
+# Original full passage pool + at most one pre-confirmed student-top1 negative.
 set -euo pipefail
+
+# Usage: bash train_rg_dal_1000.sh [0|0.05|0.1|0.15|0.25]
+# An explicit positional probability takes precedence over the environment.
+if (( $# > 1 )); then
+  echo "Usage: bash $0 [0|0.05|0.1|0.15|0.25]" >&2
+  exit 2
+fi
+HARD_NEGATIVE_PROBABILITY="${1:-${HARD_NEGATIVE_PROBABILITY:-0.1}}"
+case "$HARD_NEGATIVE_PROBABILITY" in
+  0|0.0|0.00) HARD_NEGATIVE_PROBABILITY=0; PROBABILITY_TAG=p0 ;;
+  0.05) PROBABILITY_TAG=p005 ;;
+  0.1|0.10) HARD_NEGATIVE_PROBABILITY=0.1; PROBABILITY_TAG=p010 ;;
+  0.15) PROBABILITY_TAG=p015 ;;
+  0.25) PROBABILITY_TAG=p025 ;;
+  *) echo "Supported probabilities: 0, 0.05, 0.1, 0.15, 0.25" >&2; exit 2 ;;
+esac
 
 source /usr/local/miniconda3/etc/profile.d/conda.sh
 conda activate /hy-tmp/DeAR/envs/dear-p
@@ -13,8 +29,19 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
 cd /root/dear_kk_mse_new
 DAL_INIT_CKPT="${DAL_INIT_CKPT:-/hy-tmp/DeAR/models/Llama-3.2-3B}"
-DAL_OUTPUT="${DAL_OUTPUT:-/hy-tmp/DeAR/outputs/dear-p-3b-ce-kd-kk-pngap-pnlambda-no-sll-1000}"
+DAL_OUTPUT="${DAL_OUTPUT:-/hy-tmp/DeAR/outputs/dear-kk-gap-lambda-student-top1-teacher05-${PROBABILITY_TAG}}"
 MAX_STEPS="${MAX_STEPS:-1000}"
+HARD_CANDIDATES="${HARD_CANDIDATES:-/hy-tmp/DeAR/data/student_top1_teacher05_7371}"
+HARD_ARGS=(--hard_negative_probability "$HARD_NEGATIVE_PROBABILITY")
+if test -s "$HARD_CANDIDATES/COMPLETE.json"; then
+  # Reuse identical tokenization metadata across p=0/0.1/0.25 runs.
+  # At p=0 Dataset performs no hard replacement or extra RNG draws.
+  HARD_ARGS+=(--hard_negative_candidates "$HARD_CANDIDATES")
+elif [[ "$HARD_NEGATIVE_PROBABILITY" != 0 ]]; then
+  echo "Mining incomplete: $HARD_CANDIDATES/COMPLETE.json missing" >&2
+  exit 1
+fi
+echo "[train] hard_probability=$HARD_NEGATIVE_PROBABILITY candidates=$HARD_CANDIDATES output=$DAL_OUTPUT"
 mkdir -p /hy-tmp/DeAR/logs
 
 if test -s "$DAL_INIT_CKPT/adapter_config.json"; then
@@ -44,6 +71,7 @@ deepspeed --include localhost:0 pointwise_reranker/reranker_train.py \
   --use_pn_lambda true --lambda_pn_lambda "${LAMBDA_PN_LAMBDA:-0.1}" \
   --pn_lambda_temperature "${PN_LAMBDA_TAU:-0.25}" \
   --dataset_name json --train_dir /hy-tmp/DeAR/data/msmarco-passage/train.jsonl.gz \
+  "${HARD_ARGS[@]}" \
   --fp16 --per_device_train_batch_size 2 --gradient_accumulation_steps 8 --train_n_passages 8 --learning_rate "$LEARNING_RATE" \
   --q_max_len 32 --p_max_len 196 --max_steps "$MAX_STEPS" --logging_steps 25 --save_strategy no \
   --seed 42 --data_seed 42 --dataset_proc_num 1 --dataloader_num_workers 2 --report_to none --overwrite_output_dir \

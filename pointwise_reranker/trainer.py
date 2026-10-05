@@ -2,6 +2,7 @@
 import os
 import logging
 import math
+from collections import Counter
 from typing import Optional
 
 import torch
@@ -27,6 +28,9 @@ class RerankerTrainer(Trainer):
         self._repro_first_batch_logged = False
         self._repro_first_qids = []
         self._repro_first_10_qids_logged = False
+        self._hard_injected_count = 0
+        self._hard_query_count = 0
+        self._hard_reasons = Counter()
 
     def _reset_pn_lambda_log_totals(self):
         self._pn_lambda_loss_sum = 0.0
@@ -34,6 +38,13 @@ class RerankerTrainer(Trainer):
         self._pn_lambda_batches = 0
 
     def log(self, logs):
+        if self._hard_query_count:
+            for reason in ('missing_candidate', 'probability_missed', 'already_present', 'replaced'):
+                logs['hard_' + reason + '_count'] = self._hard_reasons[reason]
+            self._hard_reasons.clear()
+            logs['hard_injected_queries'] = self._hard_injected_count
+            logs['hard_injection_rate'] = self._hard_injected_count / self._hard_query_count
+            self._hard_injected_count = self._hard_query_count = 0
         if bool(getattr(self.model, "use_pn_lambda", False)):
             count = self._pn_lambda_batches
             logs["pn_lambda_loss"] = self._pn_lambda_loss_sum / count if count else 0.0
@@ -124,6 +135,10 @@ class RerankerTrainer(Trainer):
         repro_qids = inputs.pop("_repro_qids", [])
         repro_positive_docids = inputs.pop("_repro_positive_docids", [])
         repro_negative_docids = inputs.pop("_repro_negative_docids", [])
+        self._hard_reasons.update(inputs.pop('_hard_reason', []))
+        hard_injected = inputs.pop('_hard_injected', [])
+        self._hard_injected_count += sum(hard_injected)
+        self._hard_query_count += len(hard_injected)
         if not self._repro_first_batch_logged:
             logger.info("REPRO first_batch_qids=%s", repro_qids)
             logger.info("REPRO first_batch_positive_docids=%s", repro_positive_docids)

@@ -1,6 +1,7 @@
 # data.py
 import os
 import random
+import os
 import logging
 from dataclasses import dataclass
 from typing import List, Tuple
@@ -11,6 +12,16 @@ from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer, BatchEncoding, DataCollatorWithPadding
 
 from arguments import DataArguments
+from runtime_hard_negative import load_candidates, candidate_indices, injection_decision
+try:
+    from mine_intent_hard_negatives import classify, make_context
+except ModuleNotFoundError:
+    # reranker_train.py is launched as a file, so sys.path starts at
+    # pointwise_reranker/ rather than the repository root.
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from mine_intent_hard_negatives import classify, make_context
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +43,11 @@ class HFRerankerTrainDataset:
         ]
         logger.info("REPRO dataset_first_10_qids=%s", first_qids)
         
+        candidates = load_candidates(data_args.hard_negative_candidates, data_args.train_path,
+                                     data_args.q_max_len, data_args.p_max_len) if data_args.hard_negative_candidates else {}
         self.preprocessor = RerankerTrainPreProcessor(tokenizer_student, tokenizer_teacher,
-                                                      data_args.q_max_len, data_args.p_max_len)
+                                                      data_args.q_max_len, data_args.p_max_len,
+                                                      hard_candidates=candidates)
         self.tokenizer_student = tokenizer_student
         self.tokenizer_teacher = tokenizer_teacher
         #查询文本的最大token长度
@@ -52,6 +66,7 @@ class HFRerankerTrainDataset:
         #将数据集分成 shard_num 个部分，并返回第 shard_idx 个部分。
         self.dataset = self.dataset.shard(shard_num, shard_idx)
         if self.preprocessor is not None:
+            raw_dataset = self.dataset
             self.dataset = self.dataset.map(#对每份数据进行tokenization:将自然语言文本转换为模型能够理解的数字表示
                 self.preprocessor, # 预处理函数
                 batched=False, # 逐条处理（非批处理）
@@ -59,15 +74,33 @@ class HFRerankerTrainDataset:
                 remove_columns=self.dataset.column_names,# 删除原始列
                 desc="Tokenizing train dataset",# 进度条描述
             )
+            required_metadata = {
+                "repro_qid", "repro_positive_docids", "repro_negative_docids",
+                "negative_hard_labels",
+                "teacher_approved_top1_indices",
+            }
+            if not required_metadata.issubset(self.dataset.column_names):
+                # Older callable fingerprints can reuse tokenization caches
+                # written before reproducibility metadata was introduced.
+                logger.warning("Rebuilding train tokenization cache missing reproducibility metadata")
+                self.dataset = raw_dataset.map(
+                    self.preprocessor,
+                    batched=False,
+                    num_proc=self.proc_num,
+                    remove_columns=raw_dataset.column_names,
+                    load_from_cache_file=False,
+                    desc="Rebuilding train dataset with reproducibility metadata",
+                )
         return self.dataset
 
 class RerankerTrainPreProcessor:
-    def __init__(self, tokenizer_student, tokenizer_teacher, query_max_length=32, text_max_length=256, separator=' '):
+    def __init__(self, tokenizer_student, tokenizer_teacher, query_max_length=32, text_max_length=256, separator=' ', hard_candidates=None):
         self.tokenizer_student = tokenizer_student
         self.tokenizer_teacher = tokenizer_teacher
         self.query_max_length = query_max_length
         self.text_max_length = text_max_length
         self.separator = separator
+        self.hard_candidates = hard_candidates or {}
 
     def __call__(self, example):
         query_text = 'query: ' + example['query']#在原始查询前添加 'query: ' 前缀
@@ -83,6 +116,7 @@ class RerankerTrainPreProcessor:
 # 存放学生tokenized的正文档pos_stu
         pos_stu, pos_tch = [], []
         neg_stu, neg_tch = [], []
+        neg_hard_labels = []
         # 遍历正文档列表
         for pos in example['positive_passages']:
             
@@ -103,9 +137,14 @@ class RerankerTrainPreProcessor:
             neg_tch.append(self.tokenizer_teacher.encode(doc_text, add_special_tokens=False,
                                                          max_length=self.text_max_length - 3, truncation=True))
 
+        context = make_context(example['query'], example['positive_passages'])
+        neg_hard_labels = [classify(neg, context)['labels'] for neg in example['negative_passages']]
+
         return {
             'query_student': q_stu, 'positives_student': pos_stu, 'negatives_student': neg_stu,
             'query_teacher': q_tch, 'positives_teacher': pos_tch, 'negatives_teacher': neg_tch,
+            'negative_hard_labels': neg_hard_labels,
+            'teacher_approved_top1_indices': candidate_indices(example, self.hard_candidates),
             # Reproducibility metadata only. It is removed by the collator and
             # trainer before the model forward pass.
             'repro_qid': str(example['query_id']),
@@ -121,6 +160,8 @@ class RerankerTrainDataset(Dataset):
         self.tokenizer_teacher = tokenizer_teacher# 文本 → 数字
         self.data_args = data_args
         self.total_len = len(self.train_data)
+        self._injection_rng = None
+        self._injection_pid = None
 
     def create_one_example(
     self,
@@ -490,6 +531,21 @@ class RerankerTrainDataset(Dataset):
                 range(len(neg_stu)),
                 neg_size,
             )
+        hard_probability = float(getattr(self.data_args, 'hard_negative_probability', 0.0))
+        approved = group.get('teacher_approved_top1_indices')
+        if hard_probability > 0 and (approved is None or len(approved) != len(pos_stu)):
+            raise ValueError('Missing positive-specific teacher approval metadata; rebuild tokenization cache')
+        hard_index = approved[pos_idx] if approved is not None else -1
+        if hard_index >= len(neg_stu):
+            raise ValueError('hard candidate index exceeds negative pool')
+        # Separate stream per worker, initialized without consuming baseline RNG.
+        # Fixed draws for EVERY sample keep both experiments aligned after rejection.
+        if self._injection_rng is None or self._injection_pid != os.getpid():
+            self._injection_rng = random.Random(f'hard-injection-v1:{torch.initial_seed()}')
+            self._injection_pid = os.getpid()
+        neg_indices, hard_position, hard_reason = injection_decision(
+            neg_indices, hard_index, hard_probability, self._injection_rng)
+
         #学生负文档
         ns_stu = [
             neg_stu[i]
@@ -529,6 +585,8 @@ class RerankerTrainDataset(Dataset):
             "qid": qid,
             "positive_docid": positive_docid,
             "negative_docids": selected_negative_docids,
+            "hard_injected": int(hard_position >= 0),
+            "hard_reason": hard_reason,
         }
 
 
@@ -620,6 +678,8 @@ class RerankerTrainCollator:
             "_repro_negative_docids": [
                 item["negative_docids"] for item in repro_metadata
             ],
+            "_hard_reason": [item['hard_reason'] for item in repro_metadata],
+            "_hard_injected": [item['hard_injected'] for item in repro_metadata],
         }
 class HFRerankerInferenceDataset:
     def __init__(self, tokenizer_student: PreTrainedTokenizer, tokenizer_teacher: PreTrainedTokenizer, 
