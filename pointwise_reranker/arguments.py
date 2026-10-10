@@ -59,6 +59,14 @@ class ModelArguments:
     use_pn_lambda: bool = field(default=False)
     lambda_pn_lambda: float = field(default=0.05)
     pn_lambda_temperature: float = field(default=0.25)
+    # Query-side under/over-estimation correction (UCD).  The selected sets
+    # are sampled from detached teacher/student rank errors; gradients flow
+    # only through the selected student scores in the UCD objective.
+    use_ucd: bool = field(default=False)
+    lambda_ucd: float = field(default=0.01)
+    ucd_mu: float = field(default=0.5)
+    ucd_num_low: int = field(default=2)
+    ucd_num_high: int = field(default=2)
     # Continuous contextual residual inference.  This is deliberately
     # separate from TS-SetRank: it never turns a listwise distribution into
     # binary relevance feedback or updates a Beta posterior.

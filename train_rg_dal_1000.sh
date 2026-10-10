@@ -25,9 +25,11 @@ export HF_HOME=/hy-tmp/DeAR/cache/hf
 export HF_DATASETS_CACHE=/hy-tmp/DeAR/cache/datasets
 export TMPDIR=/hy-tmp/DeAR/tmp
 export TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
+# Required by torch.use_deterministic_algorithms(True) for CUDA >= 10.2.
+export CUBLAS_WORKSPACE_CONFIG="${CUBLAS_WORKSPACE_CONFIG:-:4096:8}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
-cd /root/dear_kk_mse_new
+cd /root/dear
 DAL_INIT_CKPT="${DAL_INIT_CKPT:-/hy-tmp/DeAR/models/Llama-3.2-3B}"
 DAL_OUTPUT="${DAL_OUTPUT:-/hy-tmp/DeAR/outputs/dear-kk-gap-lambda-student-top1-teacher05-${PROBABILITY_TAG}}"
 MAX_STEPS="${MAX_STEPS:-1000}"
@@ -70,6 +72,8 @@ deepspeed --include localhost:0 pointwise_reranker/reranker_train.py \
   --dal_warmup_ratio 0 \
   --use_pn_lambda true --lambda_pn_lambda "${LAMBDA_PN_LAMBDA:-0.1}" \
   --pn_lambda_temperature "${PN_LAMBDA_TAU:-0.25}" \
+  --use_ucd "${USE_UCD:-true}" --lambda_ucd "${LAMBDA_UCD:-0.01}" \
+  --ucd_mu "${UCD_MU:-0.5}" --ucd_num_low "${UCD_NUM_LOW:-2}" --ucd_num_high "${UCD_NUM_HIGH:-2}" \
   --dataset_name json --train_dir /hy-tmp/DeAR/data/msmarco-passage/train.jsonl.gz \
   "${HARD_ARGS[@]}" \
   --fp16 --per_device_train_batch_size 2 --gradient_accumulation_steps 8 --train_n_passages 8 --learning_rate "$LEARNING_RATE" \

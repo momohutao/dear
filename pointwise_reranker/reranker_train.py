@@ -73,6 +73,12 @@ def main():
                 model_args.teacher_model_name_or_path, model_args.temperature, model_args.alpha, model_args.loss_type)
 
     set_seed(training_args.seed)
+    # Make CUDA/PyTorch operations reproducible across repeated runs with the
+    # same data and worker configuration.  This must be enabled before model
+    # construction and DataLoader creation.
+    torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
     logger.info(
         "REPRO seed=%s data_seed=%s local_rank=%s pythonhashseed=%s "
         "dataloader_workers=%s full_determinism=%s",

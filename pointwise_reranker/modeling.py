@@ -52,6 +52,8 @@ class RerankerOutput(ModelOutput):
     loss_pn_lambda: Optional[Tensor] = None
     weighted_pn_lambda: Optional[Tensor] = None
     pn_lambda_mean_delta_ndcg: Optional[Tensor] = None
+    loss_ucd: Optional[Tensor] = None
+    weighted_ucd: Optional[Tensor] = None
 
     loss_rat: Optional[Tensor] = None
     weighted_rat: Optional[Tensor] = None
@@ -105,6 +107,55 @@ def compute_pn_lambda_loss(
     loss = (normalized_weights * pair_loss).sum(dim=1).mean()
     mean_delta_ndcg = delta_ndcg.mean()
     return loss, mean_delta_ndcg
+
+
+def compute_ucd_loss(
+    grouped_student: Tensor,
+    grouped_teacher: Tensor,
+    mu: float,
+    num_low: int,
+    num_high: int,
+) -> Tensor:
+    """Dynamic under/over-estimation correction with teacher ordering."""
+    if mu <= 0 or num_low < 0 or num_high < 0:
+        raise ValueError("UCD requires mu > 0 and nonnegative sample counts.")
+    if num_low == 0 or grouped_student.numel() == 0:
+        return grouped_student.new_zeros(())
+
+    losses = []
+    for student_row, teacher_row in zip(grouped_student, grouped_teacher):
+        with torch.no_grad():
+            student_order = torch.argsort(student_row, descending=True, stable=True)
+            teacher_order = torch.argsort(teacher_row, descending=True, stable=True)
+            student_rank = torch.empty_like(student_order)
+            teacher_rank = torch.empty_like(teacher_order)
+            student_rank[student_order] = torch.arange(student_order.numel(), device=student_row.device)
+            teacher_rank[teacher_order] = torch.arange(teacher_order.numel(), device=student_row.device)
+            low_idx = torch.nonzero(student_rank > teacher_rank, as_tuple=False).flatten()
+            high_idx = torch.nonzero(student_rank < teacher_rank, as_tuple=False).flatten()
+            low_weights = torch.tanh((mu * (student_rank[low_idx] - teacher_rank[low_idx]).float()).clamp_min(0))
+            high_weights = torch.tanh((mu * (teacher_rank[high_idx] - student_rank[high_idx]).float()).clamp_min(0))
+            if low_idx.numel() == 0 or low_weights.sum() <= 0:
+                continue
+            low_take = min(num_low, low_idx.numel())
+            low_sel = low_idx[torch.multinomial(low_weights, low_take, replacement=False)]
+            low_sel = low_sel[torch.argsort(teacher_rank[low_sel], stable=True)]
+            if high_idx.numel() and high_weights.sum() > 0 and num_high > 0:
+                high_take = min(num_high, high_idx.numel())
+                high_sel = high_idx[torch.multinomial(high_weights, high_take, replacement=False)]
+            else:
+                high_sel = high_idx.new_empty((0,))
+
+        position_losses = []
+        for k, low_doc in enumerate(low_sel):
+            allowed_high = high_sel[teacher_rank[high_sel] > teacher_rank[low_doc]]
+            competitors = student_row[low_sel[k:]]
+            if allowed_high.numel():
+                competitors = torch.cat((competitors, student_row[allowed_high]), dim=0)
+            position_losses.append(-(student_row[low_doc] - torch.logsumexp(competitors, dim=0)))
+        if position_losses:
+            losses.append(torch.stack(position_losses).mean())
+    return torch.stack(losses).mean() if losses else grouped_student.new_zeros(())
 
 class DistillRerankerModel(nn.Module):
     def __init__(
@@ -169,6 +220,13 @@ class DistillRerankerModel(nn.Module):
         self.pn_lambda_temperature = (
             model_args.pn_lambda_temperature if model_args is not None else 0.25
         )
+        self.use_ucd = bool(model_args is not None and model_args.use_ucd)
+        self.lambda_ucd = model_args.lambda_ucd if model_args is not None else 0.0
+        self.ucd_mu = model_args.ucd_mu if model_args is not None else 0.5
+        self.ucd_num_low = model_args.ucd_num_low if model_args is not None else 2
+        self.ucd_num_high = model_args.ucd_num_high if model_args is not None else 2
+        if self.lambda_ucd < 0 or self.ucd_mu <= 0:
+            raise ValueError("UCD lambda must be nonnegative and ucd_mu positive.")
 
         if self.lambda_pn_lambda < 0:
             raise ValueError("lambda_pn_lambda must be nonnegative.")
@@ -614,6 +672,17 @@ class DistillRerankerModel(nn.Module):
                     grouped_student,
                     self.pn_lambda_temperature,
                 )
+            loss_ucd = torch.zeros((), device=student_logits.device, dtype=torch.float32)
+            if self.use_ucd:
+                if grouped_teacher is None:
+                    raise ValueError("UCD requires frozen teacher logits.")
+                loss_ucd = compute_ucd_loss(
+                    grouped_student,
+                    grouped_teacher.detach(),
+                    self.ucd_mu,
+                    self.ucd_num_low,
+                    self.ucd_num_high,
+                )
             loss_rat = torch.zeros(
                 (),
                 device=student_logits.device,
@@ -659,6 +728,7 @@ class DistillRerankerModel(nn.Module):
                     + self.dal_nn_weight * loss_dal_nn
                 )
                 + self.lambda_pn_lambda * loss_pn_lambda
+                + self.lambda_ucd * loss_ucd
             )
             if (
                 self.training
@@ -709,6 +779,9 @@ class DistillRerankerModel(nn.Module):
                 loss_pn_lambda=loss_pn_lambda.detach(),
                 weighted_pn_lambda=(self.lambda_pn_lambda * loss_pn_lambda).detach(),
                 pn_lambda_mean_delta_ndcg=pn_lambda_mean_delta_ndcg.detach(),
+
+                loss_ucd=loss_ucd.detach(),
+                weighted_ucd=(self.lambda_ucd * loss_ucd).detach(),
 
                 loss_rat=loss_rat.detach(),
                 weighted_rat=(

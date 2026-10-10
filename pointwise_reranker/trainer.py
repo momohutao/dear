@@ -31,6 +31,8 @@ class RerankerTrainer(Trainer):
         self._hard_injected_count = 0
         self._hard_query_count = 0
         self._hard_reasons = Counter()
+        self._ucd_loss_sum = 0.0
+        self._ucd_batches = 0
 
     def _reset_pn_lambda_log_totals(self):
         self._pn_lambda_loss_sum = 0.0
@@ -52,6 +54,11 @@ class RerankerTrainer(Trainer):
                 self._pn_lambda_delta_sum / count if count else 0.0
             )
             self._reset_pn_lambda_log_totals()
+        if bool(getattr(self.model, "use_ucd", False)):
+            logs["ucd_loss"] = self._ucd_loss_sum / self._ucd_batches if self._ucd_batches else 0.0
+            logs["ucd_weighted_loss"] = float(getattr(self.model, "lambda_ucd", 0.0)) * logs["ucd_loss"]
+            self._ucd_loss_sum = 0.0
+            self._ucd_batches = 0
         return super().log(logs)
 
     def _dal_scale(self) -> float:
@@ -170,6 +177,9 @@ class RerankerTrainer(Trainer):
             self._pn_lambda_delta_sum += float(
                 outputs.pn_lambda_mean_delta_ndcg.detach().float().item()
             )
+        if model.training and bool(getattr(model, "use_ucd", False)):
+            self._ucd_loss_sum += float(outputs.loss_ucd.detach().float().item())
+            self._ucd_batches += 1
 
         if return_outputs:
             return outputs.loss, outputs

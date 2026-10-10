@@ -7,7 +7,7 @@ source /usr/local/miniconda3/etc/profile.d/conda.sh
 conda activate /hy-tmp/DeAR/envs/dear-p
 export TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
-cd /root/dear_kk_mse_new
+cd /root/dear
 
 CKPT="${CKPT:-/hy-tmp/DeAR/outputs/dear-p-3b-kk-rg-dal-pnmargin-nnsl1-1000}"
 RESULT_DIR="${RESULT_DIR:-results/$(basename "$CKPT")-raw-dl19}"
