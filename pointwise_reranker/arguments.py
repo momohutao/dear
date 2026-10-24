@@ -13,69 +13,7 @@ class ModelArguments:
     teacher_model_name_or_path: str = field(default=None, metadata={"help": "Teacher model path/id."})
     temperature: float = field(default=2.0)
     alpha: float = field(default=0.3)
-    # Legacy margin Smooth-L1 arguments retained for compatibility only.
-    # Training requires lambda_margin_sll=0; margin_sll_beta is unused.
-    lambda_margin_sll: float = field(default=0.0)
-    margin_sll_beta: float = field(default=1.0)
-    # Legacy setwise arguments retained for historical checkpoint inference.
-    # Setwise SLL training is removed; lambda_sll must remain zero.
-    use_setwise_head: bool = field(default=False)
-    lambda_sll: float = field(default=0.0)
-    set_size: int = field(default=5)
-    set_heads: int = field(default=4)
-    set_layers: int = field(default=2)
-    set_hidden_dim: int = field(default=256)
-    set_teacher_temperature: float = field(default=2.0)
-    set_student_temperature: float = field(default=2.0)
-    # Used only for the trained contextual head's TS feedback at inference.
-    setwise_feedback_mode: str = field(default="topk")  # topk | threshold
-    setwise_feedback_top_k: int = field(default=2)
-    setwise_feedback_temperature: float = field(default=2.0)
-    setwise_head_learning_rate: float = field(default=1e-4)
-    # Reliability-gated dual-channel distillation (RG-DAL).
-    # Both setwise SLL and margin Smooth-L1 training have been removed.
-    use_dal: bool = field(default=False)
-    lambda_dal: float = field(default=0.01)
-    use_pn_gap: bool = field(default=True)
-    dal_pn_weight: float = field(default=1.0)
-    dal_nn_weight: float = field(default=0.0)
-    # The NN Smooth-L1 teacher target is active only for a normalized teacher
-    # margin strictly larger than this value.
-    dal_nn_margin_threshold: float = field(default=0.5)
-    dal_max_teacher_negatives: int = field(default=2)
-    # Soft, detached pair weights for the PN teacher-student margin gap.
-    dal_pn_teacher_weight: float = field(default=0.1)
-    dal_pn_teacher_temperature: float = field(default=0.25)
-    dal_gap_temperature: float = field(default=0.25)
-    dal_teacher_confidence_scale: float = field(default=0.5)
-    dal_teacher_margin_cap: float = field(default=2.0)
-    # The first ratio of optimizer steps uses only DeAR+KK.  DAL then ramps
-    # linearly during an equally long interval (0.2 => full DAL at 40%).
-    dal_warmup_ratio: float = field(default=0.2)
-     
-    # Label-directed PN loss weighted by the absolute nDCG change caused by
-    # swapping the labelled positive with each sampled negative.  The
-    # per-query weights are normalized inside the loss.
-    use_pn_lambda: bool = field(default=False)
-    lambda_pn_lambda: float = field(default=0.05)
-    pn_lambda_temperature: float = field(default=0.25)
-    # Query-side under/over-estimation correction (UCD).  The selected sets
-    # are sampled from detached teacher/student rank errors; gradients flow
-    # only through the selected student scores in the UCD objective.
-    use_ucd: bool = field(default=False)
-    lambda_ucd: float = field(default=0.01)
-    ucd_mu: float = field(default=0.5)
-    ucd_num_low: int = field(default=2)
-    ucd_num_high: int = field(default=2)
-    # Continuous contextual residual inference.  This is deliberately
-    # separate from TS-SetRank: it never turns a listwise distribution into
-    # binary relevance feedback or updates a Beta posterior.
-    setwise_residual_enabled: bool = field(default=False)
-    setwise_residual_top_k: int = field(default=30)
-    setwise_residual_context_rounds: int = field(default=3)
-    setwise_residual_gamma: float = field(default=0.1)
-    # Defaults to <encoded_save_path>.setwise_residual_trace.jsonl.
-    setwise_residual_trace_path: Optional[str] = field(default=None)
+    lambda_margin_mse: float = field(default=0.0)
     # modeling
     untie_encoder: bool = field(default=False)
     loss_type: str = field(default="softmax_ce")  # softmax_ce | ranknet_teacher | ranknet_binary | listnet_* | lambda_*
@@ -98,6 +36,9 @@ class ModelArguments:
     lambda_rvr: float = field(
         default=0.05
     )
+
+    # MiniLM-style regional relation KL on down_proj outputs.
+    lambda_down: float = field(default=0.0)
 
     relation_temperature: float = field(
         default=2.0
@@ -125,104 +66,6 @@ class ModelArguments:
         default=1e-8
     )
 
-    # Query-level test-time low-rank adaptation (TTA).
-    # These parameters are used only by inference.py; no DeAR weights are updated.
-    tta_enabled: bool = field(default=False)
-    tta_rank: int = field(default=8)
-    tta_gamma: float = field(default=1.0)
-    tta_steps: int = field(default=20)
-    tta_learning_rate: float = field(default=1e-2)
-    tta_top_k: int = field(default=100)
-    tta_n_pos: int = field(default=5)
-    tta_n_neg: int = field(default=20)
-    tta_temperature: float = field(default=0.5)
-    tta_anchor_weight: float = field(default=0.0)
-    tta_use_teacher: bool = field(default=False)
-    tta_protect_top_k: int = field(default=0)
-    tta_top10_gamma: float = field(default=-1.0)
-    tta_correction_mode: bool = field(default=False)
-    tta_correction_top_k: int = field(default=30)
-    tta_teacher_top_k: int = field(default=5)
-    tta_teacher_delta: float = field(default=0.1)
-    tta_teacher_confidence_scale: float = field(default=1.0)
-    # TOUR-style continuous list-reward TTA.  The teacher supplies a soft
-    # distribution over a query's initial DeAR top-M candidates; only a fresh
-    # query-local vector u is optimized at inference time.
-    tta_listwise_reward_mode: bool = field(default=False)
-    tta_listwise_top_k: int = field(default=30)
-    # Kept separate from legacy pairwise-TTA parameters: a 3072-dim direct
-    # vector has a much larger aggregate Adam update than the old bounded
-    # residual and therefore needs conservative defaults.
-    tta_listwise_steps: int = field(default=5)
-    tta_listwise_learning_rate: float = field(default=1e-3)
-    tta_teacher_temperature: float = field(default=0.5)
-    tta_student_temperature: float = field(default=1.0)
-    tta_trust_weight: float = field(default=1.0)
-    tta_u_l2_weight: float = field(default=0.01)
-    # Normalized entropy H(p_teacher) / log(M).  A lower value means the
-    # teacher distribution is more concentrated and therefore more reliable.
-    tta_teacher_entropy_max: float = field(default=0.90)
-    # Mean absolute rank displacement divided by M-1, comparing teacher and
-    # initial DeAR orders on the same top-M candidates.
-    tta_min_rank_disagreement: float = field(default=0.10)
-    # Optional nDCG-oriented discount 1/log2(rank + 1), based on initial
-    # DeAR rank.  Disabled by default to retain the exact KL objective.
-    tta_position_discount: bool = field(default=False)
-    # RankLLaMA continuous-feedback distribution TTA.  Unlike the legacy
-    # pairwise and TOUR-style branches above, this keeps a separate switch so
-    # existing experiments retain their exact behavior.
-    use_distribution_tta: bool = field(default=False)
-    tta_candidate_k: int = field(default=30)
-    tta_lr: float = field(default=1e-2)
-    tta_lambda_local: float = field(default=1.0)
-    tta_window_size: int = field(default=10)
-    tta_window_stride: int = field(default=5)
-    tta_u_norm_weight: float = field(default=1e-4)
-    tta_use_confidence_gate: bool = field(default=False)
-    tta_min_teacher_confidence: float = field(default=0.0)
-    tta_early_stop_patience: int = field(default=3)
-    tta_early_stop_tolerance: float = field(default=1e-5)
-    tta_teacher_cache_path: Optional[str] = field(default=None)
-    tta_log_diagnostics: bool = field(default=True)
-    # Holdout-entropy-consistent hard-routing TTA.  This is deliberately a
-    # separate inference-only switch: the final query ranking is exactly the
-    # raw DeAR+KK+SLL branch or exactly a freshly optimized query-vector
-    # branch, never a score interpolation of the two.
-    use_entropy_hard_gate_tta: bool = field(default=False)
-    tta_entropy_temperature: float = field(default=2.0)
-    tta_entropy_threshold: float = field(default=0.0)
-    tta_force_adapted: bool = field(default=False)
-    tta_single_fold_gate: bool = field(default=False)
-    # TS-SetRank is an independent, inference-only Bayesian post-processor.
-    # Keeping this separate from TTA means disabling it preserves DeAR exactly.
-    use_ts_setrank: bool = field(default=False)
-    ts_candidate_topk: int = field(default=100)
-    ts_budget: int = field(default=10)
-    ts_batch_size: int = field(default=10)
-    ts_exploration_rounds: int = field(default=2)
-    ts_prior_mode: str = field(default="dear")  # uniform | dear
-    ts_prior_strength: float = field(default=4.0)
-    ts_prior_temperature: float = field(default=1.0)
-    ts_final_mode: str = field(default="fusion")  # posterior | fusion
-    ts_fusion_weight: float = field(default=0.4)
-    ts_seed: int = field(default=42)
-    # The mock judge is only for deterministic unit/integration tests; it has
-    # no relevance knowledge and is not a valid DL19 experiment.
-    ts_judge_type: str = field(default="generative")  # generative | contextual | mock
-    # Deliberately distinct from model_name_or_path: the latter is always the
-    # frozen DeAR pointwise checkpoint, while this is a causal setwise judge.
-    setwise_model_name_or_path: Optional[str] = field(default=None)
-    ts_judge_temperature: float = field(default=0.6)
-    ts_judge_load_in_4bit: bool = field(default=False)
-    # Compact P-ID answers need only a few tokens; a small cap reduces
-    # unsolicited explanations that can contain misleading extra IDs.
-    ts_judge_max_new_tokens: int = field(default=32)
-    ts_judge_max_input_tokens: int = field(default=4096)
-    ts_judge_document_max_chars: int = field(default=1600)
-    # Defaults to <encoded_save_path>.ts_setrank_trace.jsonl when omitted.
-    ts_trace_path: Optional[str] = field(default=None)
-    teacher_only: bool = field(default=False)
-
 @dataclass
 class DataArguments:
     train_dir: str = field(default=None, metadata={"help": "Path OR file to json/jsonl (optional if using load_from_disk)."})
@@ -232,8 +75,6 @@ class DataArguments:
     train_n_passages: int = field(default=8)
     positive_passage_no_shuffle: bool = field(default=False)
     negative_passage_no_shuffle: bool = field(default=False)
-    hard_negative_probability: float = field(default=0.0)
-    hard_negative_candidates: Optional[str] = field(default=None)
 
     encode_in_path: List[str] = field(default=None)
     encoded_save_path: str = field(default=None)
@@ -258,10 +99,6 @@ class DataArguments:
     data_cache_dir: Optional[str] = field(default=None)
 
     def __post_init__(self):
-        if not 0.0 <= self.hard_negative_probability <= 1.0:
-            raise ValueError('hard_negative_probability must be in [0,1]')
-        if self.hard_negative_probability > 0 and not self.hard_negative_candidates:
-            raise ValueError('Runtime hard injection requires --hard_negative_candidates from a completed mining run')
         if self.dataset_name is not None:
             # using load_from_disk; we still set split names for convenience
             self.dataset_split = 'train'
@@ -273,7 +110,10 @@ class DataArguments:
 
         if self.train_dir is not None:
             if os.path.isdir(self.train_dir):
-                files = os.listdir(self.train_dir)
+                # Split-style datasets (including MVP) must not mix validation
+                # examples into training. Keep the legacy sharded-dir fallback.
+                files = (['train.jsonl'] if os.path.isfile(os.path.join(self.train_dir, 'train.jsonl'))
+                         else sorted(os.listdir(self.train_dir)))
                 self.train_dir = os.path.join(os.path.abspath(os.getcwd()), self.train_dir)
                 self.train_path = [
                     os.path.join(self.train_dir, f)
@@ -302,5 +142,29 @@ class ModelTrainingArguments(TrainingArguments):
     num_answers_per_question: int = field(default=4)
     eval_interval: int = field(default=100)
     ckpt_save_interval: int = field(default=1000)
+    # 每隔多少个 optimizer steps 保存一个可推理的 LoRA adapter。
+    # 设为0表示不进行中途保存。
+    adapter_save_steps: int = field(default=0)
+    # Optional external DL19/DL20 early stopping. Zero keeps the historical
+    # training path unchanged.
+    early_stop_eval_steps: int = field(default=0)
+    early_stop_patience: int = field(default=3)
+    early_stop_min_delta: float = field(default=0.0)
+    early_stop_eval_batch_size: int = field(default=32)
+    early_stop_metric: str = field(default="dl", metadata={"help": "Checkpoint selection metric: dl or beir8"})
+    early_stop_beir_data_dir: str = field(default="/hy-tmp/DeAR/data/bm25_beir_dl19_20")
+    early_stop_beir_qrels_dir: str = field(default="/hy-tmp/DeAR/data/qrels/beir-v1.0.0")
+    early_stop_dl19_path: str = field(
+        default="/hy-tmp/DeAR/data/bm25_beir_dl19_20/dl19.jsonl"
+    )
+    early_stop_dl20_path: str = field(
+        default="/hy-tmp/DeAR/data/bm25_beir_dl19_20/dl20.jsonl"
+    )
+    early_stop_dl19_qrels: str = field(
+        default="/hy-tmp/DeAR/data/qrels/2019qrels-pass.txt"
+    )
+    early_stop_dl20_qrels: str = field(
+        default="/hy-tmp/DeAR/data/qrels/qrels.dl20-passage.txt"
+    )
     skip_unfinished_episodes: bool = field(default=True)
     max_grad_norm: float = field(default=1.0)

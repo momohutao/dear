@@ -10,47 +10,42 @@ export HF_DATASETS_CACHE=/hy-tmp/DeAR/cache/datasets
 export TMPDIR=/hy-tmp/DeAR/tmp
 export TRANSFORMERS_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
-export CUDA_VISIBLE_DEVICES=0,1,2,3
-export OMP_NUM_THREADS=8
-# 固定Python与CUDA计算
-export PYTHONHASHSEED=42
-export CUBLAS_WORKSPACE_CONFIG=:4096:8
+# 默认使用全部四张卡；外部已设置CUDA_VISIBLE_DEVICES时尊重外部设置。
+if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+  export CUDA_VISIBLE_DEVICES=0,1,2,3
+fi
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
+# 默认优先吞吐；FULL_DETERMINISM=true 可恢复严格确定性。
+export PYTHONHASHSEED="${PYTHONHASHSEED:-${SEED:-42}}"
+export FULL_DETERMINISM="${FULL_DETERMINISM:-false}"
+if [[ "$FULL_DETERMINISM" == "true" ]]; then
+  export CUBLAS_WORKSPACE_CONFIG=:4096:8
+fi
 export TOKENIZERS_PARALLELISM=false
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+PERSISTENT_WORKERS=false
+if (( ${DATALOADER_WORKERS:-4} > 0 )); then
+  PERSISTENT_WORKERS=true
+fi
+# pyserini/pyjnius needs an explicit JVM path on this host.
+export JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64
+export JVM_PATH="$JAVA_HOME/lib/server/libjvm.so"
 
-export CODE_DIR=/root/dear_kk_mse_new
-export RUN_NAME=dear-p-3b-sll-kk-new
+export CODE_DIR=/root/dear-sll-vv
+
+export RUN_NAME="${RUN_NAME:-dear-p-3b-SLL-kk-downkl-0.01-1k-mvp}"
+export TRAIN_DIR="${TRAIN_DIR:-/hy-tmp/DeAR/data/MVP-train}"
+
 export CKPT_DIR=/hy-tmp/DeAR/outputs/${RUN_NAME}
-export LOG_FILE=/hy-tmp/DeAR/logs/${RUN_NAME}.log
-export RESULT_DIR=/root/dear_kk_mse_new/results/${RUN_NAME}
 
-# Optional inference-only RankLLaMA distribution TTA.  It is disabled by
-# default, so this training-and-baseline script keeps its original behavior.
-export USE_DISTRIBUTION_TTA="${USE_DISTRIBUTION_TTA:-false}"
-export USE_ENTROPY_HARD_GATE_TTA="${USE_ENTROPY_HARD_GATE_TTA:-false}"
-export TTA_CANDIDATE_K="${TTA_CANDIDATE_K:-30}"
-export TTA_GAMMA="${TTA_GAMMA:-0.10}"
-export TTA_STEPS="${TTA_STEPS:-10}"
-export TTA_LR="${TTA_LR:-1e-2}"
-export TTA_TEACHER_TEMPERATURE="${TTA_TEACHER_TEMPERATURE:-2.0}"
-export TTA_STUDENT_TEMPERATURE="${TTA_STUDENT_TEMPERATURE:-2.0}"
-export TTA_LAMBDA_LOCAL="${TTA_LAMBDA_LOCAL:-1.0}"
-export TTA_WINDOW_SIZE="${TTA_WINDOW_SIZE:-10}"
-export TTA_WINDOW_STRIDE="${TTA_WINDOW_STRIDE:-5}"
-export TTA_ANCHOR_WEIGHT="${TTA_ANCHOR_WEIGHT:-0.1}"
-export TTA_U_NORM_WEIGHT="${TTA_U_NORM_WEIGHT:-1e-4}"
-export TTA_USE_CONFIDENCE_GATE="${TTA_USE_CONFIDENCE_GATE:-true}"
-export TTA_MIN_TEACHER_CONFIDENCE="${TTA_MIN_TEACHER_CONFIDENCE:-0.0}"
-export TTA_EARLY_STOP_PATIENCE="${TTA_EARLY_STOP_PATIENCE:-3}"
-export TTA_EARLY_STOP_TOLERANCE="${TTA_EARLY_STOP_TOLERANCE:-1e-5}"
-export TTA_TEACHER_CACHE_PATH="${TTA_TEACHER_CACHE_PATH:-/hy-tmp/DeAR/cache/teacher_scores/rankllama_dl19_top30.jsonl}"
-export TTA_ENTROPY_TEMPERATURE="${TTA_ENTROPY_TEMPERATURE:-2.0}"
-export TTA_ENTROPY_THRESHOLD="${TTA_ENTROPY_THRESHOLD:-0.0}"
-export TTA_FORCE_ADAPTED="${TTA_FORCE_ADAPTED:-false}"
-export TTA_SINGLE_FOLD_GATE="${TTA_SINGLE_FOLD_GATE:-false}"
+export LOG_FILE=/hy-tmp/DeAR/logs/${RUN_NAME}.log
+
+export RESULT_DIR=/root/dear_mse/results/${RUN_NAME}
 
 mkdir -p /hy-tmp/DeAR/outputs
 mkdir -p /hy-tmp/DeAR/logs
 mkdir -p /hy-tmp/DeAR/tmp
+mkdir -p "$CKPT_DIR"
 mkdir -p "$RESULT_DIR"
 
 cd "$CODE_DIR"
@@ -61,10 +56,12 @@ python -m py_compile \
   pointwise_reranker/modeling.py \
   pointwise_reranker/region_relation.py
 
-echo "===== KK + Margin Smooth-L1 training starts ====="
+echo "===== Training starts: $RUN_NAME ====="
 
-deepspeed --include localhost:0 \
-  pointwise_reranker/reranker_train.py \
+# 从基础模型重新训练；DeepSpeed显式启动四个进程。
+# 5个候选在32GB V100上默认每卡2个query、累积2步，维持有效query batch=16。
+# 首次tokenization只由主进程执行，8个CPU worker可缩短四卡启动等待。
+deepspeed --num_gpus="${NUM_GPUS:-4}" pointwise_reranker/reranker_train.py \
   --deepspeed ./config/ds_config.json \
   --output_dir "$CKPT_DIR" \
   --model_name_or_path /hy-tmp/DeAR/models/Llama-3.2-3B \
@@ -72,11 +69,11 @@ deepspeed --include localhost:0 \
   --temperature 2 \
   --alpha 0.1 \
   --loss_type softmax_ce \
-  --lambda_margin_sll 0.01 \
-  --margin_sll_beta 1.0 \
+  --lambda_margin_mse 0.01 \
   --use_relation_distill true \
-  --lambda_rat 0.02 \
-  --lambda_rvr 0 \
+  --lambda_rat "${LAMBDA_RAT:-0}" \
+  --lambda_rvr "${LAMBDA_KK:-0.02}" \
+  --lambda_down "${LAMBDA_DOWN:-0.01}" \
   --relation_temperature 2 \
   --relation_heads 8 \
   --student_relation_layer 27 \
@@ -84,71 +81,66 @@ deepspeed --include localhost:0 \
   --relation_use_rope true \
   --relation_eps 1e-8 \
   --dataset_name json \
-  --train_dir /hy-tmp/DeAR/data/msmarco-passage/train.jsonl.gz \
+  --train_dir "$TRAIN_DIR" \
   --fp16 \
-  --per_device_train_batch_size 2 \
-  --gradient_accumulation_steps 8 \
-  --train_n_passages 2 \
+  --per_device_train_batch_size "${TRAIN_BATCH_SIZE:-2}" \
+  --gradient_accumulation_steps "${GRAD_ACCUM_STEPS:-2}" \
+  --train_n_passages "${TRAIN_N_PASSAGES:-5}" \
   --learning_rate 1e-4 \
   --q_max_len 32 \
   --p_max_len 196 \
-  --max_steps 1000 \
-  --logging_steps 100 \
+  --max_steps "${MAX_STEPS:-1000}" \
+  --logging_steps 20 \
   --save_strategy no \
-  --seed 42 \
-  --data_seed 42 \
-  --dataset_proc_num 1 \
-  --dataloader_num_workers 2 \
-  --full_determinism true \
+  --adapter_save_steps "${ADAPTER_SAVE_STEPS:-1000}" \
+  --early_stop_eval_steps "${EARLY_STOP_EVAL_STEPS:-0}" \
+  --early_stop_patience "${EARLY_STOP_PATIENCE:-3}" \
+  --early_stop_min_delta "${EARLY_STOP_MIN_DELTA:-0}" \
+  --early_stop_eval_batch_size "${EARLY_STOP_EVAL_BATCH_SIZE:-32}" \
+  --seed "${SEED:-42}" \
+  --data_seed "${DATA_SEED:-${SEED:-42}}" \
+  --dataset_proc_num "${DATASET_PROC_NUM:-8}" \
+  --dataloader_num_workers "${DATALOADER_WORKERS:-4}" \
+  --dataloader_pin_memory true \
+  --dataloader_persistent_workers "$PERSISTENT_WORKERS" \
+  --ddp_timeout "${DDP_TIMEOUT:-7200}" \
+  --full_determinism "$FULL_DETERMINISM" \
   --report_to none \
   --overwrite_output_dir \
   2>&1 | tee "$LOG_FILE"
 
-test -s "$CKPT_DIR/adapter_config.json"
-test -s "$CKPT_DIR/adapter_model.bin"
-
-echo "===== KK + Margin Smooth-L1 training complete; DL19 inference starts ====="
-
-DISTRIBUTION_TTA_ARGS=()
-if [[ "$USE_DISTRIBUTION_TTA" == "true" ]]; then
-  DISTRIBUTION_TTA_ARGS=(
-    --use_distribution_tta true
-    --tta_candidate_k "$TTA_CANDIDATE_K" --tta_gamma "$TTA_GAMMA"
-    --tta_steps "$TTA_STEPS" --tta_lr "$TTA_LR"
-    --tta_teacher_temperature "$TTA_TEACHER_TEMPERATURE"
-    --tta_student_temperature "$TTA_STUDENT_TEMPERATURE"
-    --tta_lambda_local "$TTA_LAMBDA_LOCAL"
-    --tta_window_size "$TTA_WINDOW_SIZE" --tta_window_stride "$TTA_WINDOW_STRIDE"
-    --tta_anchor_weight "$TTA_ANCHOR_WEIGHT" --tta_u_norm_weight "$TTA_U_NORM_WEIGHT"
-    --tta_use_confidence_gate "$TTA_USE_CONFIDENCE_GATE"
-    --tta_min_teacher_confidence "$TTA_MIN_TEACHER_CONFIDENCE"
-    --tta_early_stop_patience "$TTA_EARLY_STOP_PATIENCE"
-    --tta_early_stop_tolerance "$TTA_EARLY_STOP_TOLERANCE"
-    --tta_teacher_cache_path "$TTA_TEACHER_CACHE_PATH"
-  )
+# Set TRAIN_ONLY=1 to skip both DL19 and DL20 evaluation.
+if [[ "${TRAIN_ONLY:-0}" == "1" ]]; then
+  exit 0
 fi
 
-ENTROPY_HARD_GATE_TTA_ARGS=()
-if [[ "$USE_ENTROPY_HARD_GATE_TTA" == "true" ]]; then
-  ENTROPY_HARD_GATE_TTA_ARGS=(
-    --use_entropy_hard_gate_tta true
-    --tta_candidate_k "$TTA_CANDIDATE_K" --tta_gamma "$TTA_GAMMA"
-    --tta_steps "$TTA_STEPS" --tta_lr "$TTA_LR"
-    --tta_teacher_temperature "$TTA_TEACHER_TEMPERATURE"
-    --tta_student_temperature "$TTA_STUDENT_TEMPERATURE"
-    --tta_entropy_temperature "$TTA_ENTROPY_TEMPERATURE"
-    --tta_entropy_threshold "$TTA_ENTROPY_THRESHOLD"
-    --tta_anchor_weight "$TTA_ANCHOR_WEIGHT" --tta_u_norm_weight "$TTA_U_NORM_WEIGHT"
-    --tta_teacher_cache_path "$TTA_TEACHER_CACHE_PATH"
-    --tta_force_adapted "$TTA_FORCE_ADAPTED"
-    --tta_single_fold_gate "$TTA_SINGLE_FOLD_GATE"
-    --tta_log_diagnostics true
-  )
+# 早停训练使用验证均值最高的adapter；普通训练仍使用最终adapter。
+EVAL_CKPT_DIR="$CKPT_DIR"
+if [[ "${EARLY_STOP_EVAL_STEPS:-0}" -gt 0 ]]; then
+  if [[ ! -s "$CKPT_DIR/best-adapter/adapter_config.json" ]]; then
+    echo "错误：早停最佳模型不存在：$CKPT_DIR/best-adapter" >&2
+    exit 1
+  fi
+  EVAL_CKPT_DIR="$CKPT_DIR/best-adapter"
 fi
 
-CUDA_VISIBLE_DEVICES=0 python pointwise_reranker/inference.py \
+# 训练成功且 adapter 保存完成后，才开始评测。
+for adapter_file in adapter_config.json; do
+  if [[ ! -s "$EVAL_CKPT_DIR/$adapter_file" ]]; then
+    echo "错误：模型文件不存在或为空：$EVAL_CKPT_DIR/$adapter_file" >&2
+    exit 1
+  fi
+done
+if [[ ! -s "$EVAL_CKPT_DIR/adapter_model.bin" && ! -s "$EVAL_CKPT_DIR/adapter_model.safetensors" ]]; then
+  echo "错误：adapter 权重不存在：$EVAL_CKPT_DIR" >&2
+  exit 1
+fi
+
+echo "===== Adapter saved; DL19 inference starts ====="
+
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES%%,*}" python pointwise_reranker/inference.py \
   --output_dir "$RESULT_DIR/temp_dl19" \
-  --model_name_or_path "$CKPT_DIR" \
+  --model_name_or_path "$EVAL_CKPT_DIR" \
   --tokenizer_name /hy-tmp/DeAR/models/Llama-3.2-3B \
   --teacher_model_name_or_path /hy-tmp/DeAR/models/llama2-13b-rankllama-teacher \
   --encode_in_path /hy-tmp/DeAR/data/bm25_beir_dl19_20/dl19.jsonl \
@@ -160,8 +152,6 @@ CUDA_VISIBLE_DEVICES=0 python pointwise_reranker/inference.py \
   --q_max_len 32 \
   --p_max_len 196 \
   --dataloader_num_workers 0 \
-  "${DISTRIBUTION_TTA_ARGS[@]}" \
-  "${ENTROPY_HARD_GATE_TTA_ARGS[@]}" \
   --overwrite_output_dir
 
 test -s "$RESULT_DIR/dl19.txt"
@@ -181,5 +171,10 @@ python -m pyserini.eval.trec_eval \
   "$RESULT_DIR/ranked_dl19.trec" \
   | tee "$RESULT_DIR/evaluation_results.log"
 
-echo "===== Finished ====="
+echo "===== DL19 finished ====="
 grep "ndcg_cut_10" "$RESULT_DIR/evaluation_results.log"
+
+echo "===== DL20 evaluation starts ====="
+CKPT_DIR="$EVAL_CKPT_DIR" EVAL_SET=dl20 bash "$CODE_DIR/full_dl20.sh"
+
+echo "===== Training + DL19 + DL20 finished ====="

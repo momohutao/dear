@@ -2,37 +2,23 @@
 import logging
 import os
 import sys
-import hashlib
-import random
+from dataclasses import dataclass
+from typing import Optional
 
-import numpy as np
 import torch
 from transformers import AutoTokenizer, HfArgumentParser, set_seed
 from transformers.integrations import is_deepspeed_zero3_enabled
 from arguments import ModelArguments, DataArguments, ModelTrainingArguments as TrainingArguments
 from modeling import DistillRerankerModel
 from data import HFRerankerTrainDataset, RerankerTrainDataset, RerankerTrainCollator
-from trainer import RerankerTrainer, save_zero3_peft_adapter
+from trainer import (
+    RerankerTrainer,
+    save_zero3_peft_adapter,
+    PeriodicAdapterSaveCallback,
+    DLAverageEarlyStoppingCallback,
+)
 
 logger = logging.getLogger(__name__)
-
-
-def _hash_trainable_parameters(model) -> tuple[str, list[str], int]:
-    """Return a stable SHA256 fingerprint without changing any RNG state."""
-    digest = hashlib.sha256()
-    names = []
-    numel = 0
-    for name, parameter in model.named_parameters():
-        if not parameter.requires_grad:
-            continue
-        tensor = parameter.detach().cpu().contiguous()
-        names.append(name)
-        numel += tensor.numel()
-        digest.update(name.encode("utf-8"))
-        digest.update(str(tuple(tensor.shape)).encode("ascii"))
-        digest.update(str(tensor.dtype).encode("ascii"))
-        digest.update(tensor.view(torch.uint8).numpy().tobytes())
-    return digest.hexdigest(), names, numel
 
 def main():
     parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
@@ -73,63 +59,6 @@ def main():
                 model_args.teacher_model_name_or_path, model_args.temperature, model_args.alpha, model_args.loss_type)
 
     set_seed(training_args.seed)
-    # Make CUDA/PyTorch operations reproducible across repeated runs with the
-    # same data and worker configuration.  This must be enabled before model
-    # construction and DataLoader creation.
-    torch.use_deterministic_algorithms(True)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    logger.info(
-        "REPRO seed=%s data_seed=%s local_rank=%s pythonhashseed=%s "
-        "dataloader_workers=%s full_determinism=%s",
-        training_args.seed,
-        training_args.data_seed,
-        training_args.local_rank,
-        os.environ.get("PYTHONHASHSEED", "<unset>"),
-        training_args.dataloader_num_workers,
-        training_args.full_determinism,
-    )
-    python_rng_hash = hashlib.sha256(
-        repr(random.getstate()).encode("utf-8")
-    ).hexdigest()
-    numpy_rng_hash = hashlib.sha256(
-        np.random.get_state()[1].tobytes()
-    ).hexdigest()
-    torch_rng_hash = hashlib.sha256(
-        torch.random.get_rng_state().numpy().tobytes()
-    ).hexdigest()
-    cuda_rng_hash = "n/a"
-    if torch.cuda.is_available():
-        cuda_rng_hash = hashlib.sha256(
-            torch.cuda.get_rng_state().cpu().numpy().tobytes()
-        ).hexdigest()
-    logger.info(
-        "REPRO rng_state_sha256 python=%s numpy=%s torch=%s cuda=%s",
-        python_rng_hash,
-        numpy_rng_hash,
-        torch_rng_hash,
-        cuda_rng_hash,
-    )
-    logger.info(
-        "REPRO torch_initial_seed=%s cuda_initial_seed=%s "
-        "deterministic_algorithms=%s cudnn_deterministic=%s cudnn_benchmark=%s",
-        torch.initial_seed(),
-        torch.cuda.initial_seed() if torch.cuda.is_available() else "n/a",
-        torch.are_deterministic_algorithms_enabled(),
-        torch.backends.cudnn.deterministic,
-        torch.backends.cudnn.benchmark,
-    )
-    logger.info(
-        "REPRO optimization_config lr=%s per_device_batch=%s grad_accum=%s "
-        "max_steps=%s scheduler=%s warmup_ratio=%s warmup_steps=%s",
-        training_args.learning_rate,
-        training_args.per_device_train_batch_size,
-        training_args.gradient_accumulation_steps,
-        training_args.max_steps,
-        training_args.lr_scheduler_type,
-        training_args.warmup_ratio,
-        training_args.warmup_steps,
-    )
 
     # Tokenizers
     tokenizer_student = AutoTokenizer.from_pretrained(
@@ -150,75 +79,67 @@ def main():
     model = DistillRerankerModel.build(
         model_args=model_args,
         train_args=training_args,
-        student_pad_token_id=(
-            tokenizer_student.pad_token_id
-        ),
-        teacher_pad_token_id=(
-            tokenizer_teacher.pad_token_id
-        ),
+        train_n_passages=data_args.train_n_passages,
         temperature=model_args.temperature,
         alpha=model_args.alpha,
         cache_dir=model_args.cache_dir,
     )
-    parameter_hash, trainable_names, trainable_numel = _hash_trainable_parameters(model)
-    logger.info("REPRO trainable_parameter_names=%s", trainable_names)
-    logger.info(
-        "REPRO initial_trainable_parameter_sha256=%s tensors=%d numel=%d",
-        parameter_hash,
-        len(trainable_names),
-        trainable_numel,
-    )
 
-    # 训练时不需要生成 KV cache
+    # 训练时不需要生成KV cache
     model.student.config.use_cache = False
     model.teacher.config.use_cache = False
-   
-    if (
-        model.student.config.pad_token_id
-        != tokenizer_student.pad_token_id
-    ):
-        raise ValueError(
-            "Student model/tokenizer pad_token_id mismatch: "
-            f"model={model.student.config.pad_token_id}, "
-            f"tokenizer={tokenizer_student.pad_token_id}"
-        )
 
-    if (
-        model.teacher.config.pad_token_id
-        != tokenizer_teacher.pad_token_id
-    ):
-        raise ValueError(
-            "Teacher model/tokenizer pad_token_id mismatch: "
-            f"model={model.teacher.config.pad_token_id}, "
-            f"tokenizer={tokenizer_teacher.pad_token_id}"
-        )
-
-    logger.info(
-        "PAD alignment: student=%s, teacher=%s",
-        tokenizer_student.pad_token_id,
-        tokenizer_teacher.pad_token_id,
-    )
     # Dataset
-    hf_ds = HFRerankerTrainDataset(
-        tokenizer_student=tokenizer_student,
-        tokenizer_teacher=tokenizer_teacher,
-        data_args=data_args,
-        cache_dir=data_args.data_cache_dir or model_args.cache_dir,
-    ).process()
+    # 分布式训练时只允许主进程先构建Arrow缓存。
+    # 其他rank等待主进程完成，然后直接读取同一份缓存。
+    with training_args.main_process_first(
+        desc="tokenize training dataset",
+    ):
+        hf_ds = HFRerankerTrainDataset(
+            tokenizer_student=tokenizer_student,
+            tokenizer_teacher=tokenizer_teacher,
+            data_args=data_args,
+            cache_dir=(
+                data_args.data_cache_dir
+                or model_args.cache_dir
+            ),
+        ).process()
 
     train_dataset = RerankerTrainDataset(
         data_args=data_args,
         dataset=hf_ds,
         tokenizer_student=tokenizer_student,
-        tokenizer_teacher=tokenizer_teacher
+        tokenizer_teacher=tokenizer_teacher,
     )
-
-    if training_args.local_rank > 0:
-        torch.distributed.barrier()
-    if training_args.local_rank == 0:
-        torch.distributed.barrier()
-
     # Trainer
+    callbacks = []
+
+    if training_args.early_stop_eval_steps > 0:
+        callbacks.append(
+            DLAverageEarlyStoppingCallback(
+                tokenizer=tokenizer_student,
+                eval_steps=training_args.early_stop_eval_steps,
+                patience=training_args.early_stop_patience,
+                min_delta=training_args.early_stop_min_delta,
+                batch_size=training_args.early_stop_eval_batch_size,
+                q_max_len=data_args.q_max_len,
+                p_max_len=data_args.p_max_len,
+                dl19_path=training_args.early_stop_dl19_path,
+                dl20_path=training_args.early_stop_dl20_path,
+                dl19_qrels=training_args.early_stop_dl19_qrels,
+                dl20_qrels=training_args.early_stop_dl20_qrels,
+                metric=training_args.early_stop_metric,
+                beir_data_dir=training_args.early_stop_beir_data_dir,
+                beir_qrels_dir=training_args.early_stop_beir_qrels_dir,
+            )
+        )
+    elif training_args.adapter_save_steps > 0:
+        callbacks.append(
+            PeriodicAdapterSaveCallback(
+                save_steps=training_args.adapter_save_steps,
+            )
+        )
+
     trainer = RerankerTrainer(
         model=model,
         args=training_args,
@@ -229,6 +150,7 @@ def main():
             max_p_len=data_args.p_max_len,
             max_q_len=data_args.q_max_len
         ),
+        callbacks=callbacks,
     )
 
     # HF Trainer expects model attribute on dataset sometimes (for gradient cache patterns, etc.)

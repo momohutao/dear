@@ -120,7 +120,7 @@ def load_ranker(
     model.to(device)
 
     return tok, model, device
- 
+
 @torch.inference_mode()
 def score_pair(tokenizer, model, device, query: str, passage: str, title: str = "",
                q_max_len: int = 32, p_max_len: int = 196) -> float:

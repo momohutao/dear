@@ -1,7 +1,9 @@
 import math
+import os
 from typing import Dict, List, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 from transformers.models.llama.modeling_llama import (
@@ -45,9 +47,10 @@ def _resolve_llama_layers(model):
 
 class QKVHookStore:
     """
-    捕获指定Transformer层中q_proj/k_proj/v_proj的输出。
+    捕获指定Transformer层中q_proj/k_proj/v_proj/down_proj的输出。
 
     捕获到的Q/K尚未应用RoPE，之后在关系模块中显式应用。
+    down_proj输出位于MLP残差相加之前。
     """
 
     def __init__(
@@ -92,6 +95,12 @@ class QKVHookStore:
                 )
 
                 self.handles.append(handle)
+
+            down_projection = self.layers[layer_idx].mlp.down_proj
+            handle = down_projection.register_forward_hook(
+                self._make_hook(layer_idx, "down_proj")
+            )
+            self.handles.append(handle)
 
     def _make_hook(
         self,
@@ -256,21 +265,23 @@ def _build_position_ids(
     attention_mask: Tensor,
 ) -> Tensor:
     """
-    根据attention_mask生成有效token的位置编号。
+    与模型forward保持一致的位置编号。
 
-    右侧padding时：
-        attention_mask = [1,1,1,0,0]
-        position_ids   = [0,1,2,0,0]
+    训练时没有传入position_ids，LlamaModel使用arange(L)，
+    padding位置也按顺序编号，因此最后一位（Score Position）为L-1。
+    右侧padding时，有效token的编号与cumsum方式相同。
     """
 
-    position_ids = attention_mask.long().cumsum(-1) - 1
+    batch_size, sequence_length = attention_mask.shape
 
-    position_ids.masked_fill_(
-        attention_mask == 0,
-        0,
+    return (
+        torch.arange(
+            sequence_length,
+            device=attention_mask.device,
+        )
+        .unsqueeze(0)
+        .expand(batch_size, -1)
     )
-
-    return position_ids
 
 
 def _apply_llama_rope(
@@ -366,6 +377,7 @@ def _compute_token_relation(
     attention_mask: Tensor,
     temperature: float,
     use_causal_mask: bool,
+    source_mask: Tensor = None,
 ) -> Tensor:
     """
     计算token-token关系概率。
@@ -439,8 +451,12 @@ def _compute_token_relation(
         dim=-1,
     )
 
-    # padded source token不参与后续区域聚合
-    source_valid_mask = attention_mask.bool()[
+    # padded source token不参与后续区域聚合；
+    # source_mask可额外放开Score Position这一行
+    if source_mask is None:
+        source_mask = attention_mask
+
+    source_valid_mask = source_mask.bool()[
         :,
         None,
         :,
@@ -644,6 +660,112 @@ def _reverse_region_kl(
     )
 
 
+def _pool_down_regions(
+    down_states: Tensor,
+    region_ids: Tensor,
+) -> Tuple[Tensor, Tensor]:
+    """
+    将down_proj的token输出按Q/D/S区域平均池化。
+
+    down_states: [B, L, D]
+    region_ids:  [B, L], Q=0, D=1, S=2, padding=-1
+    返回:
+        pooled: [B, 3, D]
+        valid:  [B, 3]
+    """
+    if down_states.dim() != 3:
+        raise ValueError(
+            "down_proj output must have shape [B, L, D], "
+            f"got {tuple(down_states.shape)}."
+        )
+
+    if region_ids.shape[:2] != down_states.shape[:2]:
+        raise ValueError(
+            "region_ids and down_proj output must have the same "
+            f"[B, L] shape, got {tuple(region_ids.shape)} and "
+            f"{tuple(down_states.shape)}."
+        )
+
+    region_ids = region_ids.to(down_states.device)
+    # relation logits在FP32中计算，避免fp16矩阵乘法溢出或精度过低。
+    states = down_states.float()
+    pooled = []
+    valid = []
+
+    for region in range(3):
+        mask = (region_ids == region).to(states.dtype)
+        count = mask.sum(dim=-1)
+        pooled.append(
+            (states * mask.unsqueeze(-1)).sum(dim=1)
+            / count.clamp_min(1.0).unsqueeze(-1)
+        )
+        valid.append(count > 0)
+
+    return torch.stack(pooled, dim=1), torch.stack(valid, dim=1)
+
+
+def _down_relation_kl(
+    student_down: Tensor,
+    teacher_down: Tensor,
+    student_region_ids: Tensor,
+    teacher_region_ids: Tensor,
+    temperature: float,
+    eps: float,
+) -> Tensor:
+    """
+    MiniLMv2风格的down_proj区域关系KL。
+
+    师生隐藏维度可以不同；双方先在自身维度上构造3x3关系矩阵，
+    再计算 teacher || student 的 KL。仅共同存在的Q/D/S区域参与计算。
+    """
+    if temperature <= 0:
+        raise ValueError("relation temperature must be positive")
+
+    student_regions, student_valid = _pool_down_regions(
+        student_down,
+        student_region_ids,
+    )
+    teacher_regions, teacher_valid = _pool_down_regions(
+        teacher_down,
+        teacher_region_ids,
+    )
+
+    student_rel = torch.matmul(
+        student_regions,
+        student_regions.transpose(-1, -2),
+    ) / math.sqrt(float(student_regions.size(-1)))
+    teacher_rel = torch.matmul(
+        teacher_regions,
+        teacher_regions.transpose(-1, -2),
+    ) / math.sqrt(float(teacher_regions.size(-1)))
+
+    common = student_valid & teacher_valid
+    # softmax的目标列只允许落在共同有效区域；源行在KL后再屏蔽。
+    target_mask = common[:, None, :]
+    neg_inf = torch.finfo(student_rel.dtype).min
+    student_rel = student_rel.masked_fill(~target_mask, neg_inf)
+    teacher_rel = teacher_rel.masked_fill(~target_mask, neg_inf)
+
+    student_log_prob = F.log_softmax(
+        student_rel / temperature,
+        dim=-1,
+    )
+    teacher_prob = F.softmax(
+        teacher_rel / temperature,
+        dim=-1,
+    ).detach()
+
+    token_kl = F.kl_div(
+        student_log_prob,
+        teacher_prob,
+        reduction="none",
+    ).sum(dim=-1)
+    token_kl = token_kl * common.to(token_kl.dtype)
+
+    denominator = common.sum().clamp_min(1).to(token_kl.dtype)
+    return token_kl.sum() / denominator * (temperature ** 2)
+
+
 class RegionRelationDistiller:
     """
     DeAR-RR的RAT/RVR关系蒸馏模块。
@@ -676,6 +798,7 @@ class RegionRelationDistiller:
         self.temperature = temperature
         self.use_rope = use_rope
         self.eps = eps
+        self._printed_head_debug = set()
 
         self.student_hooks = QKVHookStore(
             model=student,
@@ -699,6 +822,7 @@ class RegionRelationDistiller:
         layer_idx: int,
         region_ids: Tensor,
         attention_mask: Tensor,
+        compute_rvr: bool = True,
     ):
         if layer_idx not in hook_store.cache:
             raise RuntimeError(
@@ -780,11 +904,37 @@ class RegionRelationDistiller:
                 )
             )
 
-        # RAT：K按照真实GQA规则展开
+        # RAT/KK：K按照真实GQA规则展开到Query heads
         repeat_number = (
             number_of_query_heads
             // number_of_kv_heads
         )
+
+        debug_key = (
+            hook_store.name,
+            layer_idx,
+        )
+
+        # 每个模型层仅在显式启用诊断时打印一次。
+        if (
+            os.environ.get("DEAR_DEBUG_ALIGNMENT", "0") == "1"
+            and debug_key not in self._printed_head_debug
+        ):
+            self._printed_head_debug.add(debug_key)
+
+            print("\n===== Head Alignment Debug =====")
+            print("model:", hook_store.name)
+            print("layer:", layer_idx)
+            print("q_proj shape:", tuple(query_projected.shape))
+            print("k_proj shape:", tuple(key_projected.shape))
+            print("v_proj shape:", tuple(value_projected.shape))
+            print("query_heads:", number_of_query_heads)
+            print("kv_heads:", number_of_kv_heads)
+            print("kv_repeat:", repeat_number if "repeat_number" in locals() else "pending")
+            print("relation_heads:", self.relation_heads)
+            print("attention_mask shape:", tuple(attention_mask.shape))
+            print("region_ids shape:", tuple(region_ids.shape))
+            print("===============================\n")
 
         key_states_for_rat = _repeat_kv(
             key_states,
@@ -804,33 +954,38 @@ class RegionRelationDistiller:
                 self.relation_heads,
             )
         )
-        # RVR：使用未展开的真实V heads
-        value_relation_heads = (
-            _reshape_relation_heads(
-                value_states,
-                self.relation_heads,
+
+        # Score Position位于padding后的最后一位（attention_mask为0），
+        # 模型在该位置打分，它作为query可以看到全部有效token，
+        # 因此该行需要作为source参与关系计算。
+        source_mask = (
+            attention_mask.bool()
+            | (region_ids.to(attention_mask.device) == 2)
+        )
+
+        # RAT：Q-K注意力关系，与模型自身的因果注意力一致
+        rat_token_relations = (
+            _compute_token_relation(
+                source_states=query_relation_heads,
+                target_states=key_relation_heads,
+                attention_mask=attention_mask,
+                temperature=self.temperature,
+                use_causal_mask=True,
+                source_mask=source_mask,
             )
         )
 
-        rat_token_relations = (
-            _compute_token_relation(
+        # KK：K-K关系，不使用因果mask。
+        kk_token_relations = None
+        if compute_rvr:
+            kk_token_relations = _compute_token_relation(
                 source_states=key_relation_heads,
                 target_states=key_relation_heads,
                 attention_mask=attention_mask,
                 temperature=self.temperature,
                 use_causal_mask=False,
+                source_mask=source_mask,
             )
-        )
-
-        rvr_token_relations = (
-            _compute_token_relation(
-                source_states=value_relation_heads,
-                target_states=value_relation_heads,
-                attention_mask=attention_mask,
-                temperature=self.temperature,
-                use_causal_mask=False,
-            )
-        )
 
         rat_regions, region_valid = (
             _aggregate_regions(
@@ -839,14 +994,16 @@ class RegionRelationDistiller:
             )
         )
 
-        rvr_regions, _ = _aggregate_regions(
-            rvr_token_relations,
-            region_ids,
-        )
+        kk_regions = None
+        if compute_rvr:
+            kk_regions, _ = _aggregate_regions(
+                kk_token_relations,
+                region_ids,
+            )
 
         return (
             rat_regions,
-            rvr_regions,
+            kk_regions,
             region_valid,
         )
 
@@ -856,6 +1013,7 @@ class RegionRelationDistiller:
         teacher_region_ids: Tensor,
         student_attention_mask: Tensor,
         teacher_attention_mask: Tensor,
+        compute_rvr: bool = True,
     ):
         """
         必须在学生和教师都完成forward之后调用。
@@ -870,11 +1028,23 @@ class RegionRelationDistiller:
             layer_idx=self.student_layer,
             region_ids=student_region_ids,
             attention_mask=student_attention_mask,
+            compute_rvr=compute_rvr,
         )
 
         teacher_rat_layers = []
         teacher_rvr_layers = []
+        teacher_down_layers = []
         teacher_valid = None
+
+        student_cached = self.student_hooks.cache[
+            self.student_layer
+        ]
+        if "down_proj" not in student_cached:
+            raise RuntimeError(
+                f"Missing down_proj output at student layer "
+                f"{self.student_layer}."
+            )
+        student_down = student_cached["down_proj"]
 
         for teacher_layer in self.teacher_layers:
             (
@@ -886,14 +1056,28 @@ class RegionRelationDistiller:
                 layer_idx=teacher_layer,
                 region_ids=teacher_region_ids,
                 attention_mask=teacher_attention_mask,
+                compute_rvr=compute_rvr,
             )
 
             teacher_rat_layers.append(
                 teacher_rat.detach()
             )
 
-            teacher_rvr_layers.append(
-                teacher_rvr.detach()
+            if compute_rvr:
+                teacher_rvr_layers.append(
+                    teacher_rvr.detach()
+                )
+
+            teacher_cached = self.teacher_hooks.cache[
+                teacher_layer
+            ]
+            if "down_proj" not in teacher_cached:
+                raise RuntimeError(
+                    f"Missing down_proj output at teacher layer "
+                    f"{teacher_layer}."
+                )
+            teacher_down_layers.append(
+                teacher_cached["down_proj"].detach()
             )
 
             if teacher_valid is None:
@@ -907,10 +1091,12 @@ class RegionRelationDistiller:
             dim=0,
         ).mean(dim=0)
 
-        teacher_rvr = torch.stack(
-            teacher_rvr_layers,
-            dim=0,
-        ).mean(dim=0)
+        teacher_rvr = None
+        if compute_rvr:
+            teacher_rvr = torch.stack(
+                teacher_rvr_layers,
+                dim=0,
+            ).mean(dim=0)
 
         loss_rat = _reverse_region_kl(
             student_probabilities=student_rat,
@@ -921,13 +1107,30 @@ class RegionRelationDistiller:
             eps=self.eps,
         )
 
-        loss_rvr = _reverse_region_kl(
-            student_probabilities=student_rvr,
-            teacher_probabilities=teacher_rvr,
-            student_region_valid=student_valid,
-            teacher_region_valid=teacher_valid,
-            temperature=self.temperature,
-            eps=self.eps,
-        )
+        loss_rvr = loss_rat.new_zeros(())
+        if compute_rvr:
+            loss_rvr = _reverse_region_kl(
+                student_probabilities=student_rvr,
+                teacher_probabilities=teacher_rvr,
+                student_region_valid=student_valid,
+                teacher_region_valid=teacher_valid,
+                temperature=self.temperature,
+                eps=self.eps,
+            )
 
-        return loss_rat, loss_rvr
+        down_losses = []
+        for teacher_down in teacher_down_layers:
+            down_losses.append(
+                _down_relation_kl(
+                    student_down=student_down,
+                    teacher_down=teacher_down,
+                    student_region_ids=student_region_ids,
+                    teacher_region_ids=teacher_region_ids,
+                    temperature=self.temperature,
+                    eps=self.eps,
+                )
+            )
+
+        loss_down = torch.stack(down_losses).mean()
+
+        return loss_rat, loss_rvr, loss_down

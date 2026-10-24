@@ -4,16 +4,16 @@ set -euo pipefail
 source /usr/local/miniconda3/etc/profile.d/conda.sh
 conda activate /hy-tmp/DeAR/envs/dear-p
 
-export DEAR_ROOT=/hy-tmp/DeAR
-export CODE_DIR=/root/dear74.45
+export DEAR_ROOT="${DEAR_ROOT:-/hy-tmp/DeAR}"
+export CODE_DIR="${CODE_DIR:-/root/dear-sll-vv}"
 # export CKPT_DIR=/hy-tmp/DeAR/outputs/dear-p-3b-rat-rvr-1k-l015
 # export BM25_DIR=/hy-tmp/DeAR/data/bm25_beir_dl19_20
 # export QRELS_DIR=/hy-tmp/DeAR/data/qrels/beir-v1.0.0
 # export RESULT_ROOT=/root/dear74.45/results/beir8_l015
-export CKPT_DIR=/hy-tmp/DeAR/outputs/dear-p-3b-original-1k-fixed
-export BM25_DIR=/hy-tmp/DeAR/data/bm25_beir_dl19_20
-export QRELS_DIR=/hy-tmp/DeAR/data/qrels/beir-v1.0.0
-export RESULT_ROOT=/root/dear74.45/results/dear_beir
+export CKPT_DIR="${CKPT_DIR:-/hy-tmp/DeAR/outputs/dear-p-3b-original-1k-fixed}"
+export BM25_DIR="${BM25_DIR:-/hy-tmp/DeAR/data/bm25_beir_dl19_20}"
+export QRELS_DIR="${QRELS_DIR:-/hy-tmp/DeAR/data/qrels/beir-v1.0.0}"
+export RESULT_ROOT="${RESULT_ROOT:-/root/dear-sll-vv/results/dear_beir}"
 
 export HF_HOME=/hy-tmp/DeAR/cache/hf
 export HF_DATASETS_CACHE=/hy-tmp/DeAR/cache/datasets
@@ -140,6 +140,11 @@ run_dataset() {
   echo "[$dataset] finished"
 }
 
+if [[ -n "${BEIR_DATASET:-}" ]]; then
+  run_dataset "$BEIR_DATASET" "${BEIR_GPU:-0}"
+  exit 0
+fi
+
 PIDS=()
 
 for index in "${!DATASETS[@]}"; do
@@ -216,5 +221,9 @@ awk '
 ' "$SUMMARY" | tee "$RESULT_ROOT/beir8_mean.log"
 
 echo "===== BEIR-8 summary ====="
-column -t -s $'\t' "$SUMMARY"
+if command -v column >/dev/null 2>&1; then
+  column -t -s $'\t' "$SUMMARY"
+else
+  cat "$SUMMARY"
+fi
 cat "$RESULT_ROOT/beir8_mean.log"
